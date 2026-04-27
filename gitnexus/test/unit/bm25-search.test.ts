@@ -202,8 +202,11 @@ describe('BM25 search', () => {
     });
 
     it('does NOT cache a transient CREATE_FTS_INDEX failure — second call retries', async () => {
-      // First call: every CREATE_FTS_INDEX fails transiently; QUERY_FTS_INDEX returns nothing.
+      // First call: every CREATE_FTS_INDEX fails transiently; QUERY_FTS_INDEX fails with "does not exist"
       mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
+        if (cypher.includes('QUERY_FTS_INDEX')) {
+          throw new Error("Catalog exception: index '...' does not exist");
+        }
         if (cypher.includes('CREATE_FTS_INDEX')) {
           throw new Error('transient lock error: Could not set lock');
         }
@@ -222,7 +225,12 @@ describe('BM25 search', () => {
       // Second call: CREATE succeeds this time. The bug being fixed: if the
       // first failure was cached, we'd see ZERO additional CREATE calls.
       mockExecuteQuery.mockReset();
-      mockExecuteQuery.mockResolvedValue([]);
+      mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
+        if (cypher.includes('QUERY_FTS_INDEX')) {
+          throw new Error("Catalog exception: index '...' does not exist");
+        }
+        return [];
+      });
 
       await searchFTSFromLbug('anything', 5, REPO);
 
@@ -234,6 +242,9 @@ describe('BM25 search', () => {
 
     it("treats 'already exists' as success and caches it (no retry on second call)", async () => {
       mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
+        if (cypher.includes('QUERY_FTS_INDEX')) {
+          throw new Error("Catalog exception: index '...' does not exist");
+        }
         if (cypher.includes('CREATE_FTS_INDEX')) {
           throw new Error("Catalog exception: index 'file_fts' already exists");
         }
@@ -254,11 +265,21 @@ describe('BM25 search', () => {
 
     it('invalidateEnsuredFTSForRepo drops cached entries so next call re-issues CREATE', async () => {
       // Prime the cache with successful creates.
-      mockExecuteQuery.mockResolvedValue([]);
+      mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
+        if (cypher.includes('QUERY_FTS_INDEX')) {
+          throw new Error("Catalog exception: index '...' does not exist");
+        }
+        return [];
+      });
       await searchFTSFromLbug('anything', 5, REPO);
 
       mockExecuteQuery.mockReset();
-      mockExecuteQuery.mockResolvedValue([]);
+      mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
+        if (cypher.includes('QUERY_FTS_INDEX')) {
+          throw new Error("Catalog exception: index '...' does not exist");
+        }
+        return [];
+      });
 
       // Without invalidation: no re-CREATE.
       await searchFTSFromLbug('anything', 5, REPO);
@@ -269,7 +290,12 @@ describe('BM25 search', () => {
       // After invalidation: next call re-issues CREATE for all 5 tables.
       invalidateEnsuredFTSForRepo(REPO);
       mockExecuteQuery.mockReset();
-      mockExecuteQuery.mockResolvedValue([]);
+      mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
+        if (cypher.includes('QUERY_FTS_INDEX')) {
+          throw new Error("Catalog exception: index '...' does not exist");
+        }
+        return [];
+      });
       await searchFTSFromLbug('anything', 5, REPO);
       expect(
         mockExecuteQuery.mock.calls.filter((c) => String(c[1]).includes('CREATE_FTS_INDEX')).length,
@@ -279,7 +305,12 @@ describe('BM25 search', () => {
     it('a pool-close listener fired by the pool adapter invalidates this repo only', async () => {
       const OTHER = 'other-repo';
 
-      mockExecuteQuery.mockResolvedValue([]);
+      mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
+        if (cypher.includes('QUERY_FTS_INDEX')) {
+          throw new Error("Catalog exception: index '...' does not exist");
+        }
+        return [];
+      });
       // Prime both repos.
       await searchFTSFromLbug('anything', 5, REPO);
       await searchFTSFromLbug('anything', 5, OTHER);
@@ -291,7 +322,12 @@ describe('BM25 search', () => {
       for (const l of poolCloseListeners) l(REPO);
 
       mockExecuteQuery.mockReset();
-      mockExecuteQuery.mockResolvedValue([]);
+      mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
+        if (cypher.includes('QUERY_FTS_INDEX')) {
+          throw new Error("Catalog exception: index '...' does not exist");
+        }
+        return [];
+      });
 
       await searchFTSFromLbug('anything', 5, REPO);
       const createForRepo = mockExecuteQuery.mock.calls.filter(
@@ -301,7 +337,12 @@ describe('BM25 search', () => {
 
       // OTHER repo's cache must remain intact — no re-CREATE for it.
       mockExecuteQuery.mockReset();
-      mockExecuteQuery.mockResolvedValue([]);
+      mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
+        if (cypher.includes('QUERY_FTS_INDEX')) {
+          throw new Error("Catalog exception: index '...' does not exist");
+        }
+        return [];
+      });
       await searchFTSFromLbug('anything', 5, OTHER);
       const createForOther = mockExecuteQuery.mock.calls.filter(
         (c) => c[0] === OTHER && String(c[1]).includes('CREATE_FTS_INDEX'),

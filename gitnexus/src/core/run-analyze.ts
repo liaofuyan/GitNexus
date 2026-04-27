@@ -20,6 +20,7 @@ import {
   executeWithReusedStatement,
   closeLbug,
   loadCachedEmbeddings,
+  ensureFTSIndex,
 } from './lbug/lbug-adapter.js';
 import {
   getStoragePaths,
@@ -34,6 +35,7 @@ import type { CachedEmbedding } from './embeddings/types.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { EMBEDDING_TABLE_NAME } from './lbug/schema.js';
 import { STALE_HASH_SENTINEL } from './lbug/schema.js';
+import { FTS_INDEXES } from './search/bm25-index.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -280,12 +282,16 @@ export async function runFullAnalysis(
     });
 
     // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
-    // FTS indexes are created lazily on first `query`/`context` call instead
-    // of eagerly here. On small repos / CI runners the LadybugDB
-    // CREATE_FTS_INDEX cost is ~440 ms × 5 (≈2 s) regardless of table size,
-    // which dominated `analyze` runtime and pushed Windows CI past its
-    // 30 s test budget. Lazy creation is implemented in
-    // `core/search/bm25-index.ts` via `ensureFTSIndex`.
+    // FTS indexes were previously created lazily on first query to save time
+    // on small repos. However, read-only consumers (MCP, CLI tools) cannot
+    // perform write operations, so lazy creation fails there. We now ensure
+    // they exist during analyze so all consumers find them ready.
+    progress('fts', 85, 'Creating search indexes...');
+    for (const { table, indexName, properties } of FTS_INDEXES) {
+      await ensureFTSIndex(table, indexName, [...properties]).catch((err) => {
+        log(`Warning: FTS index creation failed for ${table}: ${err.message}`);
+      });
+    }
 
     // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
     if (cachedEmbeddings.length > 0) {

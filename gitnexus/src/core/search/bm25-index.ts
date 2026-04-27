@@ -25,7 +25,7 @@ export interface BM25SearchResult {
  * CLI/pipeline path and the MCP pool path use identical (table, index,
  * properties) tuples and the lazy-create logic stays in one place.
  */
-const FTS_INDEXES: ReadonlyArray<{
+export const FTS_INDEXES: ReadonlyArray<{
   table: string;
   indexName: string;
   properties: readonly string[];
@@ -92,6 +92,28 @@ async function ensureFTSIndexViaExecutor(
 ): Promise<void> {
   const key = `${repoId}:${table}:${indexName}`;
   if (ensuredPoolFTS.has(key)) return;
+
+  // Check if index exists by running a dummy query. If it fails with
+  // "does not exist", then it truly doesn't exist. If it succeeds (or
+  // fails with a different error like "empty query"), then it exists.
+  // This allows read-only consumers to use indexes created by analyze
+  // without triggering a write-blocked CALL CREATE_FTS_INDEX.
+  try {
+    await executor(`CALL QUERY_FTS_INDEX('${table}', '${indexName}', '___check_exists___')`);
+    ensuredPoolFTS.add(key);
+    return;
+  } catch (e: any) {
+    const msg = String(e?.message ?? '');
+    if (!msg.includes('does not exist')) {
+      // Index exists (but query failed for other reasons) or some other error.
+      // If it doesn't say "does not exist", we assume it exists or creation would fail anyway.
+      ensuredPoolFTS.add(key);
+      return;
+    }
+  }
+
+  // Index does not exist — try to create it. This will fail on read-only
+  // connections (MCP pool), which is expected if analyze hasn't run.
   const propList = properties.map((p) => `'${p}'`).join(', ');
   try {
     await executor(
@@ -100,15 +122,13 @@ async function ensureFTSIndexViaExecutor(
     // Index was created successfully — safe to cache.
     ensuredPoolFTS.add(key);
   } catch (e: any) {
-    // 'already exists' is the happy path (index persists on disk between
-    // process invocations) — cache it. Anything else is treated as a
-    // transient failure: surface a one-time warning and leave the key
-    // unset so the NEXT query retries rather than silently using a
-    // cached failure (which previously disabled BM25 for the whole
-    // process for that repo).
     const msg = String(e?.message ?? '');
     if (msg.includes('already exists')) {
       ensuredPoolFTS.add(key);
+    } else if (msg.includes('read-only') || msg.includes('Write operations are not allowed')) {
+      // Silently skip if read-only. The subsequent query will also fail,
+      // but we avoid the scary "Cannot execute write operations" warning
+      // on every single query for repos that haven't been re-indexed yet.
     } else {
       console.warn(
         `[gitnexus] FTS index ensure failed for repo "${repoId}" table "${table}" ` +
