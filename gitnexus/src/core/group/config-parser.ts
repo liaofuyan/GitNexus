@@ -12,6 +12,7 @@ const VALID_CONTRACT_TYPES: ContractType[] = [
   'lib',
   'custom',
   'include',
+  'motan',
 ];
 const VALID_ROLES: ContractRole[] = ['provider', 'consumer'];
 
@@ -24,6 +25,10 @@ const VALID_ROLES: ContractRole[] = ['provider', 'consumer'];
 // `includes`: opt-in. The C/C++ IncludeExtractor (PR #1156) ships disabled by
 // default; enable with `detect.includes: true` for groups containing C/C++
 // repos that need cross-repo header tracking.
+//
+// `motan`: opt-in. The MotanExtractor (Weibo RPC, Spring XML config) ships
+// disabled by default; enable with `detect.motan: true` for groups containing
+// Java repos that use `<motan:service>`/`<motan:referer>` for cross-repo RPC.
 const DEFAULT_DETECT = {
   http: true,
   grpc: true,
@@ -33,6 +38,7 @@ const DEFAULT_DETECT = {
   embedding_fallback: true,
   includes: false,
   workspace_deps: false,
+  motan: false,
 };
 
 const DEFAULT_MATCHING = {

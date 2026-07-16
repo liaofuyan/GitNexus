@@ -294,6 +294,24 @@ export class ManifestExtractor {
         } else {
           rows = [];
         }
+      } else if (link.type === 'motan') {
+        // Contract is "interfaceFQN" or "interfaceFQN::group". The interface
+        // is a Java Class/Interface (typically defined in a service-api
+        // module). Strip the ::group suffix and package prefix to get the
+        // bare interface name for graph lookup.
+        const contractPart = (link.contract.split('::')[0] ?? '').trim();
+        const serviceName = contractPart.split('.').pop() ?? '';
+        if (serviceName) {
+          rows = await executor(
+            `MATCH (n) WHERE labels(n) IN ['Class','Interface'] AND n.name = $serviceName
+             RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
+             ORDER BY n.filePath ASC
+             LIMIT 1`,
+            { serviceName },
+          );
+        } else {
+          rows = [];
+        }
       } else if (link.type === 'lib') {
         // Only exact match on the symbol's name. Previous fallback to
         // CONTAINS on n.filePath would promote "react" to "react-native"
@@ -387,6 +405,8 @@ export class ManifestExtractor {
         return `grpc::${contract}`;
       case 'thrift':
         return `thrift::${contract}`;
+      case 'motan':
+        return `motan::${contract}`;
       case 'topic':
         return `topic::${contract}`;
       case 'lib':

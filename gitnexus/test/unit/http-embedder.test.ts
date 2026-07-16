@@ -529,7 +529,7 @@ describe('HTTP embedding backend', () => {
   });
 
   describe('timeout and network error handling', () => {
-    it('does not retry on timeout', async () => {
+    it('retries on timeout with fresh signal (U7/retry-timeout)', async () => {
       process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
       process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
 
@@ -543,9 +543,10 @@ describe('HTTP embedding backend', () => {
       const { isHttpEmbeddingError } = await import('../../src/core/embeddings/http-client.js');
       const err = await embedText('test').catch((e: unknown) => e);
       expect(String(err)).toContain('timed out');
-      // Type-completeness fence: a timeout must stay classifiable (#2385).
+      // U7: timeout is retried with a fresh AbortSignal, so fetch is called
+      // MAX_ATTEMPTS times (HTTP_MAX_TIMEOUT_RETRIES + 1 = 3) before failing.
       expect(isHttpEmbeddingError(err)).toBe(true);
-      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(fetch).toHaveBeenCalledTimes(3);
     });
 
     it('retries on network error then succeeds', async () => {

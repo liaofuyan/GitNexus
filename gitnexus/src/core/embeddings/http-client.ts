@@ -16,6 +16,7 @@ import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from '
 const HTTP_TIMEOUT_MS = 30_000;
 const HTTP_MAX_RETRIES = 2;
 const HTTP_RETRY_BACKOFF_MS = 1_000;
+const HTTP_MAX_TIMEOUT_RETRIES = 2;
 const HTTP_BATCH_SIZE = 64;
 const DEFAULT_DIMS = 384;
 const HTTP_BREAKER_KEY = 'embeddings-http';
@@ -210,77 +211,92 @@ const httpEmbedBatch = async (
     requestBody.dimensions = dimensions;
   }
 
-  let resp: Response;
-  try {
-    resp = await resilientFetch(
-      url,
-      {
-        method: 'POST',
-        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
+  // U7/retry-timeout: resilientFetch classifies per-attempt
+  // AbortSignal.timeout() as terminal (the signal is already aborted;
+  // retrying against it would fail immediately). This loop catches
+  // TimeoutError here and retries with a fresh signal, so an
+  // occasional slow response does not kill the whole embedding pass.
+  const MAX_ATTEMPTS = HTTP_MAX_TIMEOUT_RETRIES + 1;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    let resp: Response;
+    try {
+      resp = await resilientFetch(
+        url,
+        {
+          method: 'POST',
+          signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify(requestBody),
         },
-        body: JSON.stringify(requestBody),
-      },
-      {
-        breakerKey: HTTP_BREAKER_KEY,
-        retry: { maxAttempts: HTTP_MAX_RETRIES + 1, baseDelayMs: HTTP_RETRY_BACKOFF_MS },
-      },
-    );
-  } catch (err) {
-    if (err instanceof CircuitOpenError) {
+        {
+          breakerKey: HTTP_BREAKER_KEY,
+          retry: { maxAttempts: HTTP_MAX_RETRIES + 1, baseDelayMs: HTTP_RETRY_BACKOFF_MS },
+        },
+      );
+    } catch (err) {
+      if (err instanceof CircuitOpenError) {
+        throw new HttpEmbeddingError(
+          `Embedding endpoint circuit open (${safeUrl(url)}, batch ${batchIndex}): retry in ${Math.ceil(err.retryAfterMs / 1000)}s`,
+          { cause: err },
+        );
+      }
+      if (err instanceof DOMException && err.name === 'TimeoutError') {
+        if (attempt + 1 < MAX_ATTEMPTS) continue;
+        throw new HttpEmbeddingError(
+          `Embedding request timed out after ${HTTP_TIMEOUT_MS}ms (${safeUrl(url)}, batch ${batchIndex}) after ${MAX_ATTEMPTS} attempts`,
+          { cause: err },
+        );
+      }
+      if (err instanceof ResilientFetchExhaustedError) {
+        throw new HttpEmbeddingError(
+          `Embedding endpoint returned ${err.response.status} (${safeUrl(url)}, batch ${batchIndex})`,
+          { cause: err },
+        );
+      }
+      const reason = sanitizeReason(err instanceof Error ? err.message : String(err), url);
       throw new HttpEmbeddingError(
-        `Embedding endpoint circuit open (${safeUrl(url)}, batch ${batchIndex}): retry in ${Math.ceil(err.retryAfterMs / 1000)}s`,
+        `Embedding request failed (${safeUrl(url)}, batch ${batchIndex}): ${reason}`,
         { cause: err },
       );
     }
-    if (err instanceof DOMException && err.name === 'TimeoutError') {
+
+    if (!resp.ok) {
+      // resilientFetch already retried 5xx/429; any non-OK response here is
+      // a terminal client error (4xx other than 429).
       throw new HttpEmbeddingError(
-        `Embedding request timed out after ${HTTP_TIMEOUT_MS}ms (${safeUrl(url)}, batch ${batchIndex})`,
+        `Embedding endpoint returned ${resp.status} (${safeUrl(url)}, batch ${batchIndex})`,
+      );
+    }
+
+    // A reachable-but-wrong endpoint (e.g. a captive portal or a non-embeddings
+    // service) can answer 200 with an HTML/truncated body. Parse inside the
+    // typed-error boundary so that lands as an endpoint failure the CLI can
+    // classify, not a raw SyntaxError/TypeError on the generic stack-dump path.
+    let data: { data: EmbeddingItem[] };
+    try {
+      data = (await resp.json()) as { data: EmbeddingItem[] };
+    } catch (err) {
+      throw new HttpEmbeddingError(
+        `Embedding endpoint returned an unparseable response (${safeUrl(url)}, batch ${batchIndex})`,
         { cause: err },
       );
     }
-    if (err instanceof ResilientFetchExhaustedError) {
+    if (!Array.isArray(data?.data) || !data.data.every(isEmbeddingItem)) {
       throw new HttpEmbeddingError(
-        `Embedding endpoint returned ${err.response.status} (${safeUrl(url)}, batch ${batchIndex})`,
-        { cause: err },
+        `Embedding endpoint returned an unexpected response shape (${safeUrl(url)}, batch ${batchIndex})`,
       );
     }
-    const reason = sanitizeReason(err instanceof Error ? err.message : String(err), url);
-    throw new HttpEmbeddingError(
-      `Embedding request failed (${safeUrl(url)}, batch ${batchIndex}): ${reason}`,
-      { cause: err },
-    );
+    return data.data;
   }
 
-  if (!resp.ok) {
-    // resilientFetch already retried 5xx/429; any non-OK response here is
-    // a terminal client error (4xx other than 429).
-    throw new HttpEmbeddingError(
-      `Embedding endpoint returned ${resp.status} (${safeUrl(url)}, batch ${batchIndex})`,
-    );
-  }
-
-  // A reachable-but-wrong endpoint (e.g. a captive portal or a non-embeddings
-  // service) can answer 200 with an HTML/truncated body. Parse inside the
-  // typed-error boundary so that lands as an endpoint failure the CLI can
-  // classify, not a raw SyntaxError/TypeError on the generic stack-dump path.
-  let data: { data: EmbeddingItem[] };
-  try {
-    data = (await resp.json()) as { data: EmbeddingItem[] };
-  } catch (err) {
-    throw new HttpEmbeddingError(
-      `Embedding endpoint returned an unparseable response (${safeUrl(url)}, batch ${batchIndex})`,
-      { cause: err },
-    );
-  }
-  if (!Array.isArray(data?.data) || !data.data.every(isEmbeddingItem)) {
-    throw new HttpEmbeddingError(
-      `Embedding endpoint returned an unexpected response shape (${safeUrl(url)}, batch ${batchIndex})`,
-    );
-  }
-  return data.data;
+  // Unreachable under the current control flow, but satisfies tsc.
+  /* c8 ignore next 2 */
+  throw new HttpEmbeddingError(
+    `Embedding request timed out after ${HTTP_TIMEOUT_MS}ms (${safeUrl(url)}, batch ${batchIndex}) after ${MAX_ATTEMPTS} attempts`,
+  );
 };
 
 /**

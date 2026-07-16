@@ -1561,6 +1561,70 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     }
   });
 
+  // ── MCP-alignment endpoints ─────────────────────────────────────────
+  // Thin REST wrappers over backend.callTool(), the same dispatch the MCP
+  // tools use.  This guarantees API-MCP parity by construction — the
+  // REST route and the MCP tool are the same code path.  Existing Web-UI
+  // routes (/api/query, /api/search, /api/graph, …) are left untouched.
+  const registerMcpRoute = (
+    method: 'get' | 'post',
+    routePath: string,
+    tool: string,
+    opts?: { mutating?: boolean },
+  ): void => {
+    const middlewares: express.RequestHandler[] = [createRouteLimiter()];
+    if (opts?.mutating) middlewares.push(requireLocalhostOrigin);
+    app[method](
+      routePath,
+      ...middlewares,
+      async (req: any, res: any) => {
+        try {
+          const params = {
+            ...(req.body ?? {}),
+            repo: req.body?.repo ?? requestedRepo(req),
+          };
+          // Warm the DIRECT adapter before callTool. The DIRECT adapter's
+          // shadow-page recovery (writable open + WAL replay) persists and
+          // clears shadow pages, so the POOL adapter's subsequent read-only
+          // initLbug (inside callTool) succeeds. Without this, callTool fails
+          // with "Couldn't replay shadow pages under read-only mode" in serve
+          // mode. Best-effort: ignore warm-up errors and let callTool surface
+          // the real error.
+          try {
+            const entry = await resolveRepo(params.repo);
+            if (entry?.storagePath) {
+              await withLbugDb(path.join(entry.storagePath, 'lbug'), async () => {}, {
+                readOnly: true,
+              });
+            }
+          } catch {
+            // best-effort warm-up
+          }
+          const result = await backend.callTool(tool, params);
+          res.json(result);
+        } catch (err: any) {
+          res.status(statusFromError(err)).json({ error: err.message || `${tool} failed` });
+        }
+      },
+    );
+  };
+
+  registerMcpRoute('post', '/api/cypher', 'cypher');
+  registerMcpRoute('post', '/api/context', 'context');
+  registerMcpRoute('post', '/api/impact', 'impact');
+  registerMcpRoute('post', '/api/trace', 'trace');
+  registerMcpRoute('post', '/api/detect-changes', 'detect_changes');
+  registerMcpRoute('post', '/api/check', 'check');
+  registerMcpRoute('post', '/api/rename', 'rename', { mutating: true });
+  registerMcpRoute('post', '/api/explain', 'explain');
+  registerMcpRoute('post', '/api/pdg-query', 'pdg_query');
+  registerMcpRoute('post', '/api/route-map', 'route_map');
+  registerMcpRoute('post', '/api/tool-map', 'tool_map');
+  registerMcpRoute('post', '/api/shape-check', 'shape_check');
+  registerMcpRoute('post', '/api/api-impact', 'api_impact');
+  registerMcpRoute('get', '/api/groups', 'group_list');
+  registerMcpRoute('post', '/api/groups/sync', 'group_sync', { mutating: true });
+
   // ── Analyze API ──────────────────────────────────────────────────────
 
   // POST /api/analyze — start a new analysis job

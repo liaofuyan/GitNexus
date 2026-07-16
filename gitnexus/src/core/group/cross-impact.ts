@@ -43,8 +43,10 @@ export const DEFAULT_LOCAL_IMPACT_TIMEOUT_MS = 30_000;
 const CY_NEIGHBORS_UPSTREAM = `
 MATCH (consumer:Contract)-[l:ContractLink]->(provider:Contract)
 WHERE provider.repo = $localRepo
-  AND provider.symbolUid IN $uids
   AND provider.role = 'provider'
+  AND (provider.symbolUid IN $uids
+       OR ($targetName <> '' AND provider.symbolName = $targetName)
+       OR ($targetName <> '' AND provider.symbolName CONTAINS $targetNameSuffix))
 RETURN consumer.repo AS neighborRepo,
        consumer.symbolUid AS neighborUid,
        consumer.filePath AS neighborFilePath,
@@ -57,8 +59,10 @@ RETURN consumer.repo AS neighborRepo,
 const CY_NEIGHBORS_DOWNSTREAM = `
 MATCH (consumer:Contract)-[l:ContractLink]->(provider:Contract)
 WHERE consumer.repo = $localRepo
-  AND consumer.symbolUid IN $uids
   AND consumer.role = 'consumer'
+  AND (consumer.symbolUid IN $uids
+       OR ($targetName <> '' AND consumer.symbolName = $targetName)
+       OR ($targetName <> '' AND consumer.symbolName CONTAINS $targetNameSuffix))
 RETURN provider.repo AS neighborRepo,
        provider.symbolUid AS neighborUid,
        provider.filePath AS neighborFilePath,
@@ -309,15 +313,19 @@ export async function safeNeighborImpact(
 export function collectImpactSymbolUids(
   local: unknown,
   servicePrefix: string | undefined,
-): { uids: string[]; targetFilePath?: string } {
+): { uids: string[]; targetFilePath?: string; targetName?: string } {
   const uids = new Set<string>();
   let targetFilePath: string | undefined;
+  let targetName: string | undefined;
   const obj = local as Record<string, unknown> | null;
-  if (!obj || typeof obj !== 'object') return { uids: [], targetFilePath };
+  if (!obj || typeof obj !== 'object') return { uids: [], targetFilePath, targetName };
 
-  const target = obj.target as { id?: string; filePath?: string } | undefined;
+  const target = obj.target as { id?: string; filePath?: string; name?: string } | undefined;
   if (target?.id) {
     targetFilePath = typeof target.filePath === 'string' ? target.filePath : undefined;
+    if (typeof target.name === 'string' && target.name) {
+      targetName = target.name;
+    }
     if (fileMatchesServicePrefix(targetFilePath, servicePrefix)) {
       uids.add(String(target.id));
     }
@@ -335,7 +343,7 @@ export function collectImpactSymbolUids(
       }
     }
   }
-  return { uids: [...uids], targetFilePath };
+  return { uids: [...uids], targetFilePath, targetName };
 }
 
 function extractProcessNames(impact: unknown): string[] {
@@ -418,13 +426,27 @@ function rowToNeighbor(r: Record<string, unknown>): BridgeNeighborRow | null {
  */
 export async function resolveBridgeNeighbors(
   handle: BridgeHandle,
-  opts: { localRepo: string; uids: string[]; direction: 'upstream' | 'downstream' },
+  opts: {
+    localRepo: string;
+    uids: string[];
+    direction: 'upstream' | 'downstream';
+    targetName?: string;
+  },
 ): Promise<BridgeNeighborRow[]> {
   if (opts.uids.length === 0) return [];
   const cypher = opts.direction === 'upstream' ? CY_NEIGHBORS_UPSTREAM : CY_NEIGHBORS_DOWNSTREAM;
+  const targetName = opts.targetName ?? '';
+  // Suffix form (`.SimpleName`) matched via CONTAINS against FQN symbolNames
+  // (e.g. motan contracts store the interface FQN) without re-sync. Uses
+  // CONTAINS (not ENDS WITH) because LadybugDB Cypher supports the former but
+  // not the latter. Guarded by `$targetName <> ''` in the query so an empty
+  // targetName can't match every FQN.
+  const targetNameSuffix = targetName ? '.' + targetName : '.';
   const rows = await queryBridge<Record<string, unknown>>(handle, cypher, {
     localRepo: opts.localRepo,
     uids: opts.uids,
+    targetName,
+    targetNameSuffix,
   });
   const neighbors: BridgeNeighborRow[] = [];
   for (const raw of rows) {
@@ -546,7 +568,7 @@ export async function runGroupImpact(
     }
   }
 
-  const { uids } = collectImpactSymbolUids(local, servicePrefix);
+  const { uids, targetName } = collectImpactSymbolUids(local, servicePrefix);
   if (uids.length === 0) {
     const s = (local as { summary?: Record<string, number> })?.summary || {};
     return {
@@ -582,6 +604,7 @@ export async function runGroupImpact(
       localRepo: repoPath,
       uids,
       direction,
+      targetName,
     });
 
     const seen = new Set<string>();
@@ -639,8 +662,29 @@ export async function runGroupImpact(
         },
         remainingMs,
       );
-      if (neighborTimedOut || fan == null) {
+      if (neighborTimedOut) {
         truncatedRepos.push(n.neighborRepo);
+        continue;
+      }
+      if (fan == null) {
+        // impactByUid returned null - typically because the neighbor's
+        // symbolUid is synthetic (the interface lives in a different repo,
+        // e.g. motan consumers reference an interface defined in service-api
+        // or the provider repo, so no graph symbol matches the uid). Record
+        // the cross-link with empty local fan-out so the cross-repo
+        // dependency is still visible rather than silently dropped.
+        cross.push({
+          repo: regName,
+          repo_path: n.neighborRepo,
+          contract: {
+            id: n.contractId,
+            type: n.contractType as ContractType,
+            match_type: (n.matchType as MatchType) || 'exact',
+            confidence: n.confidence,
+          },
+          by_depth: {},
+          affected_processes: [],
+        });
         continue;
       }
 

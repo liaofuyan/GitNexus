@@ -70,7 +70,8 @@ export function normalizeContractId(id: string): string {
       return id;
     }
     case 'grpc':
-    case 'thrift': {
+    case 'thrift':
+    case 'motan': {
       // Canonical form: `<type>::<lowercased-package-or-service>[/<method>]`.
       //
       // The package/service segment is lowercased because gRPC package

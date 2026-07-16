@@ -1415,19 +1415,15 @@ export class LocalBackend {
           // Index was rebuilt — close stale connection and re-init.
           // Wrap in reinitPromises to prevent TOCTOU race where concurrent
           // callers both detect staleness and double-close the pool.
-          const reinit = (async () => {
-            try {
-              await closeLbug(poolKey);
-              this.initializedRepos.delete(poolKey);
-              this.lastObservedIndexedAt.set(poolKey, meta.indexedAt);
-              await initLbug(poolKey, repo.lbugPath);
-              this.initializedRepos.add(poolKey);
-            } finally {
-              this.reinitPromises.delete(poolKey);
-            }
-          })();
-          this.reinitPromises.set(poolKey, reinit);
-          return reinit;
+          // Index was rebuilt. Re-initializing (close + reopen) can fail in
+          // serve mode: the read-only reopen hits shadow pages left by a
+          // prior write-mode `gitnexus analyze`, and the writable-replay
+          // recovery contends with the live serve process. Keep the existing
+          // (possibly stale) pool connection and update the observed
+          // timestamp so the staleness check doesn't re-trigger. Restart
+          // `gitnexus serve` to pick up a re-indexed repo.
+          this.lastObservedIndexedAt.set(poolKey, meta.indexedAt);
+          return;
         } else {
           return; // Pool is current
         }
