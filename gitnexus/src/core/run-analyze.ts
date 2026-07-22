@@ -1792,6 +1792,8 @@ export async function runFullAnalysis(
       semanticMode = vectorIndexReady ? 'vector-index' : 'exact-scan';
     }
 
+    let embeddableNodeCount = 0;
+
     if (!embeddingSkipped) {
       const { isHttpMode } = await import('./embeddings/http-client.js');
       const httpMode = isHttpMode();
@@ -1836,6 +1838,7 @@ export async function runFullAnalysis(
       } else {
         semanticMode = 'vector-index';
       }
+      embeddableNodeCount = embeddingResult.nodesProcessed ?? 0;
     }
 
     // ── Phase 5: Finalize (98–100%) ───────────────────────────────────
@@ -1853,7 +1856,7 @@ export async function runFullAnalysis(
       /* table may not exist if embeddings never ran */
     }
 
-    if (!embeddingSkipped && stats.nodes > 0 && embeddingCount === 0) {
+    if (!embeddingSkipped && embeddableNodeCount > 0 && embeddingCount === 0) {
       throw new Error(
         'Embedding generation completed without persisted embeddings. ' +
           'The index was not registered to avoid silently reporting embeddings: 0.',
